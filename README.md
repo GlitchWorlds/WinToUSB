@@ -35,7 +35,13 @@ Built with pure Rust (`eframe`/`egui`), native Win32 APIs, and Windows deploymen
 - **MBR untuk BIOS (Legacy)**: Single active NTFS MBR partition.
 - **MBR untuk BIOS & UEFI (Dual Boot)**: Active 300 MB FAT32 System/EFI partition + NTFS Windows partition on MBR — boots across both Legacy BIOS and modern UEFI machines!
 - **Pertahankan Partisi yang Ada (Keep Existing)**: Deploy onto user-prepared partitions without wiping the physical disk.
-- **Disk & VHDX Utility Tab**: Standalone clean formatter (`NTFS`, `FAT32`, `exFAT`), bootable partition layout prep, and `.vhdx` generator.
+- **Disk & VHDX Utility Tab**: Standalone clean formatter (`NTFS`, `FAT32`, `exFAT`), bootable partition layout prep, standalone `.vhdx` generator, and **🔧 Repair / Install USB Bootloader (No Format)** to install or repair UEFI/BIOS boot files on an existing USB Windows drive in seconds without re-formatting or re-running DISM.
+
+### 5. 🛡️ Self-Healing Bootloader Cascade (`v1.0.1`)
+- **Verbose `BFSVC:` Diagnostics (`/v`)**: Always invokes `bcdboot.exe` with `/v` and surfaces exact `BFSVC:` checksum/service error lines in the live log.
+- **Tier 1 — Target Image First**: Prefers the deployed image's own `<Target>:\Windows\System32\bcdboot.exe` (eliminating Windows 10 → Windows 11 OS version skew) before falling back to host `bcdboot.exe`, plus optional `bootsect.exe /nt60 /mbr` on MBR schemes.
+- **Tier 2 — Dual-Boot Split Fallback**: When `/f ALL` fails on custom/UEFI-only ISOs missing valid PCAT `bootmgr`, automatically splits into `/f UEFI` and `/f BIOS` so UEFI bootability still succeeds cleanly.
+- **Tier 3 — Host-Boot + BCD Retarget Rescue (Exit 193)**: If modified/patched boot binaries fail PE checksum validation (`0xC1` / exit `193`), verifies matching host/target PE architecture (`winload.efi` / `winload.exe`), installs clean host boot manager files, and retargets & verifies `BCD` `{default}` entries via `bcdedit.exe /store` directly to the USB Windows partition.
 
 ---
 
@@ -63,7 +69,8 @@ Built with pure Rust (`eframe`/`egui`), native Win32 APIs, and Windows deploymen
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                   DEPLOYMENT & BOOTLOADER PIPELINE                          │
 │  Mount ISO (RAII) ─▶ DiskPart (/s) ─▶ VHDX (optional) ─▶ DISM (Live % Bar)  │
-│        ─▶ Driver / Offline Registry Hive Guard ─▶ BCDBoot (UEFI/BIOS/ALL)   │
+│        ─▶ Driver / Offline Registry Hive Guard                              │
+│        ─▶ Self-Healing BCDBoot Cascade (Target -> Split -> Host BCD Rescue) │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 

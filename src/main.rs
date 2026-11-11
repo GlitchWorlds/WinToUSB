@@ -13,16 +13,22 @@ mod tests;
 
 use app::WinToUsbApp;
 use eframe::egui::Vec2;
+use std::io::Write;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("WinToUSB v{}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(std::io::stdout(), "WinToUSB v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("WinToUSB v{} - Native Rust Windows To Go, Live Clone & Bootable USB Suite", env!("CARGO_PKG_VERSION"));
-        println!("Usage: WinToUSB.exe [--version | --help]");
+        let mut out = std::io::stdout();
+        let _ = writeln!(
+            out,
+            "WinToUSB v{} - Native Rust Windows To Go, Live Clone & Bootable USB Suite",
+            env!("CARGO_PKG_VERSION")
+        );
+        let _ = writeln!(out, "Usage: WinToUSB.exe [--version | --help]");
         return Ok(());
     }
 
@@ -30,7 +36,7 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(1180.0, 760.0))
             .with_min_inner_size(Vec2::new(860.0, 560.0))
-            .with_title("WinToUSB v1.0.0 — Windows To Go, Live OS Cloner & Bootable USB Suite"),
+            .with_title("WinToUSB v1.0.1 — Windows To Go, Live OS Cloner & Bootable USB Suite"),
         ..Default::default()
     };
 

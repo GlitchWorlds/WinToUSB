@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -92,6 +93,7 @@ pub struct WinToUsbApp {
     // UI Status & Modals
     status_text: String,
     show_guide: bool,
+    detected_windows_drives: HashSet<char>,
 }
 
 impl WinToUsbApp {
@@ -128,7 +130,7 @@ impl WinToUsbApp {
         };
 
         let status_text = format!(
-            "WinToUSB v1.0.0 siap. {} | {} disk fisik terdeteksi.",
+            "WinToUSB v1.0.1 siap. {} | {} disk fisik terdeteksi.",
             if is_admin {
                 "Hak Administrator Aktif"
             } else {
@@ -137,7 +139,7 @@ impl WinToUsbApp {
             disks.len()
         );
 
-        Self {
+        let mut app = Self {
             config,
             system_visuals,
             is_admin,
@@ -155,7 +157,10 @@ impl WinToUsbApp {
             deploy_state: Arc::new(Mutex::new(DeployState::default())),
             status_text,
             show_guide: false,
-        }
+            detected_windows_drives: HashSet::new(),
+        };
+        app.refresh_detected_windows_drives();
+        app
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -185,6 +190,7 @@ impl WinToUsbApp {
                     self.confirm_disk_text.clear();
                     self.confirm_wipe_checked = false;
                 }
+                self.refresh_detected_windows_drives();
                 self.status_text =
                     format!("Daftar disk diperbarui ({} disk terdeteksi).", self.disks.len());
             }
@@ -257,24 +263,165 @@ impl WinToUsbApp {
                 self.options.scheme.is_destructive()
             }
             DeployMode::WindowsInstallerUsb => true,
-            DeployMode::DiskVhdUtility => {
-                self.options.utility_action != UtilityAction::CreateStandaloneVhdx
-            }
+            DeployMode::DiskVhdUtility => !matches!(
+                self.options.utility_action,
+                UtilityAction::CreateStandaloneVhdx | UtilityAction::RepairUsbBootloader
+            ),
         }
     }
 
     fn available_drive_letters_on_selected_disk(&self) -> Vec<char> {
         let mut letters = Vec::new();
         if let Some(d) = self.selected_disk() {
+            if d.number == 0 || d.is_system || d.is_boot {
+                return letters;
+            }
             for p in &d.partitions {
-                if let Some(ch) = p.drive_letter {
-                    if ('E'..='Z').contains(&ch) && !letters.contains(&ch) {
+                if p.is_system || p.is_boot {
+                    continue;
+                }
+                if let Some(ch) = p.drive_letter.map(|c| c.to_ascii_uppercase()) {
+                    if ('D'..='Z').contains(&ch) && !letters.contains(&ch) {
                         letters.push(ch);
                     }
                 }
             }
         }
         letters
+    }
+
+    fn refresh_detected_windows_drives(&mut self) {
+        self.detected_windows_drives.clear();
+        for d in &self.disks {
+            if d.number == 0 || d.is_system || d.is_boot {
+                continue;
+            }
+            let has_protected = d
+                .partitions
+                .iter()
+                .any(|p| p.is_system || p.is_boot || p.drive_letter == Some('C'));
+            if has_protected {
+                continue;
+            }
+            for p in &d.partitions {
+                if let Some(ch) = p.drive_letter.map(|c| c.to_ascii_uppercase()) {
+                    if ('D'..='Z').contains(&ch)
+                        && Path::new(&format!("{}:\\Windows", ch)).is_dir()
+                    {
+                        self.detected_windows_drives.insert(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    fn safe_repair_drive_candidates(&self) -> Vec<(char, String, String, bool)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut ordered_disks: Vec<&DiskInfo> = Vec::new();
+        if let Some(sel) = self.selected_disk() {
+            ordered_disks.push(sel);
+        }
+        for d in &self.disks {
+            if self.selected_disk().map(|s| s.number != d.number).unwrap_or(true) {
+                ordered_disks.push(d);
+            }
+        }
+
+        for d in ordered_disks {
+            if d.number == 0 || d.is_system || d.is_boot {
+                continue;
+            }
+            let has_protected = d
+                .partitions
+                .iter()
+                .any(|p| p.is_system || p.is_boot || p.drive_letter == Some('C'));
+            if has_protected {
+                continue;
+            }
+            let is_removable_or_virtual = d.bus_type.eq_ignore_ascii_case("USB")
+                || d.bus_type.eq_ignore_ascii_case("FileBackedVirtual")
+                || d.bus_type.eq_ignore_ascii_case("Virtual");
+            if !self.options.allow_non_usb_target && !is_removable_or_virtual {
+                continue;
+            }
+
+            for p in &d.partitions {
+                if let Some(ch) = p.drive_letter.map(|c| c.to_ascii_uppercase()) {
+                    if ('D'..='Z').contains(&ch) && seen.insert(ch) {
+                        let fs = if p.file_system.is_empty() {
+                            p.part_type.clone()
+                        } else {
+                            p.file_system.clone()
+                        };
+                        let has_win = self.detected_windows_drives.contains(&ch);
+                        let desc = format!(
+                            "{}:\\ [Disk {} {} {}]",
+                            ch,
+                            d.number,
+                            fs,
+                            format_bytes_human(p.size_bytes)
+                        );
+                        out.push((ch, desc, fs, has_win));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn auto_detect_repair_letters(&mut self) {
+        self.refresh_detected_windows_drives();
+        let candidates = self.safe_repair_drive_candidates();
+
+        let win_pick = candidates
+            .iter()
+            .find(|(_, _, _, has_win)| *has_win)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(_, _, fs, _)| fs.eq_ignore_ascii_case("NTFS"))
+            })
+            .map(|(ch, _, _, _)| *ch);
+
+        if let Some(w) = win_pick {
+            self.options.existing_win_letter = Some(w);
+        } else if self
+            .options
+            .existing_win_letter
+            .map(|c| !candidates.iter().any(|(ch, _, _, _)| *ch == c.to_ascii_uppercase()))
+            .unwrap_or(false)
+        {
+            self.options.existing_win_letter = None;
+        }
+
+        let chosen_win = self.options.existing_win_letter;
+        let sys_pick = candidates
+            .iter()
+            .find(|(ch, _, fs, _)| {
+                Some(*ch) != chosen_win && fs.eq_ignore_ascii_case("FAT32")
+            })
+            .map(|(ch, _, _, _)| *ch)
+            .or(chosen_win);
+
+        if let Some(s) = sys_pick {
+            self.options.existing_sys_letter = Some(s);
+        }
+
+        if self.options.scheme == PartitionScheme::KeepExisting {
+            let style = self
+                .selected_disk()
+                .map(|d| d.partition_style.as_str())
+                .unwrap_or("GPT");
+            self.options.scheme = if style.eq_ignore_ascii_case("GPT") {
+                PartitionScheme::GptUefi
+            } else if sys_pick != chosen_win {
+                PartitionScheme::MbrBiosAndUefi
+            } else {
+                PartitionScheme::MbrBios
+            };
+        }
     }
 }
 
@@ -322,7 +469,7 @@ impl eframe::App for WinToUsbApp {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("💾 WinToUSB").size(20.0).strong().color(brand_color));
                 ui.label(
-                    RichText::new("v1.0.0 | Windows To Go, Live OS Cloner & Bootable USB Suite")
+                    RichText::new("v1.0.1 | Windows To Go, Live OS Cloner & Bootable USB Suite")
                         .color(ui.visuals().weak_text_color()),
                 );
 
@@ -407,6 +554,11 @@ impl eframe::App for WinToUsbApp {
                     if ui.add_enabled(!is_running, btn).clicked() {
                         self.options.mode = mode;
                         self.confirm_wipe_checked = false;
+                        if mode == DeployMode::DiskVhdUtility
+                            && self.options.utility_action == UtilityAction::RepairUsbBootloader
+                        {
+                            self.auto_detect_repair_letters();
+                        }
                     }
                 }
             });
@@ -433,7 +585,7 @@ impl eframe::App for WinToUsbApp {
 
         // Interactive Guide Modal
         if self.show_guide {
-            egui::Window::new("ℹ️ Panduan & Arsitektur WinToUSB v1.0.0")
+            egui::Window::new("ℹ️ Panduan & Arsitektur WinToUSB v1.0.1")
                 .collapsible(false)
                 .resizable(true)
                 .default_size(Vec2::new(580.0, 440.0))
@@ -475,6 +627,15 @@ impl eframe::App for WinToUsbApp {
                             ui.label(
                                 "• Disk 0, Disk Sistem, Disk Boot, dan drive internal SATA/NVMe dikunci secara permanen.\n\
                                  • Gunakan panel 'Preview Rencana Eksekusi (Dry-Run)' sebelum memulai untuk melihat perintah DiskPart/DISM/BCDBoot persis.",
+                            );
+                        });
+                        ui.add_space(6.0);
+
+                        ui.group(|ui| {
+                            ui.label(RichText::new("5. Pemulihan Bootloader Cerdas v1.0.1").strong());
+                            ui.label(
+                                "• Cascade BCDBoot otomatis: mencoba bcdboot.exe milik image target terlebih dahulu, memecah /f ALL menjadi /f UEFI + /f BIOS jika salah satu gagal, serta pemulihan otomatis berbasis host + retarget BCD pada ISO modifikasi (exit 193).\n\
+                                 • Tersedia utilitas 'Pasang / Perbaiki Bootloader USB (Tanpa Format)' di tab Alat Disk & VHDX untuk memperbaiki USB dalam hitungan detik.",
                             );
                         });
 
@@ -824,21 +985,36 @@ impl eframe::App for WinToUsbApp {
                     DeployMode::DiskVhdUtility => {
                         ui.group(|ui| {
                             ui.label(RichText::new("Pilih Operasi Utilitas:").strong());
-                            ui.radio_value(
-                                &mut self.options.utility_action,
-                                UtilityAction::FormatSinglePartition,
-                                "🧹 Format Bersih USB (1 Partisi: NTFS / FAT32 / exFAT)",
-                            );
-                            ui.radio_value(
-                                &mut self.options.utility_action,
-                                UtilityAction::PrepareBootableLayout,
-                                "📐 Buat Partisi Bootable (EFI FAT32 + Windows NTFS)",
-                            );
-                            ui.radio_value(
-                                &mut self.options.utility_action,
-                                UtilityAction::CreateStandaloneVhdx,
-                                "📦 Buat File Virtual Disk (.VHDX) di Drive USB",
-                            );
+                            ui.add_enabled_ui(!is_running, |ui| {
+                                ui.radio_value(
+                                    &mut self.options.utility_action,
+                                    UtilityAction::FormatSinglePartition,
+                                    "🧹 Format Bersih USB (1 Partisi: NTFS / FAT32 / exFAT)",
+                                );
+                                ui.radio_value(
+                                    &mut self.options.utility_action,
+                                    UtilityAction::PrepareBootableLayout,
+                                    "📐 Buat Partisi Bootable (EFI FAT32 + Windows NTFS)",
+                                );
+                                ui.radio_value(
+                                    &mut self.options.utility_action,
+                                    UtilityAction::CreateStandaloneVhdx,
+                                    "📦 Buat File Virtual Disk (.VHDX) di Drive USB",
+                                );
+                                if ui
+                                    .radio(
+                                        self.options.utility_action
+                                            == UtilityAction::RepairUsbBootloader,
+                                        "🔧 Pasang / Perbaiki Bootloader USB yang Sudah Ada (Tanpa Format / Tanpa DISM Ulang)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.options.utility_action =
+                                        UtilityAction::RepairUsbBootloader;
+                                    self.confirm_wipe_checked = false;
+                                    self.auto_detect_repair_letters();
+                                }
+                            });
 
                             ui.add_space(6.0);
                             match self.options.utility_action {
@@ -896,6 +1072,99 @@ impl eframe::App for WinToUsbApp {
                                         ui.checkbox(&mut self.options.vhdx_dynamic, "Dynamic (Expandable)");
                                     });
                                 }
+                                UtilityAction::RepairUsbBootloader => {
+                                    ui.label(
+                                        RichText::new(
+                                            "💡 Memasang/memperbaiki bootloader UEFI/BIOS langsung ke partisi USB yang sudah berisi Windows (dengan cascade pemulihan exit 193) tanpa memformat ulang data.",
+                                        )
+                                        .size(12.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                    );
+                                    ui.add_space(4.0);
+
+                                    if ui
+                                        .add_enabled(
+                                            !is_running,
+                                            egui::Button::new("🔍 Deteksi Otomatis Partisi USB"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.refresh_disks();
+                                        self.auto_detect_repair_letters();
+                                    }
+
+                                    let candidates = self.safe_repair_drive_candidates();
+                                    ui.add_space(4.0);
+                                    ui.add_enabled_ui(!is_running, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new("Drive Sistem (BOOT/EFI):").strong());
+                                            if candidates.is_empty() {
+                                                ui.label(
+                                                    RichText::new("(Tidak ada huruf partisi USB non-C: yang terdeteksi)")
+                                                        .color(warn_color),
+                                                );
+                                            } else {
+                                                for (ch, desc, _, _) in &candidates {
+                                                    ui.radio_value(
+                                                        &mut self.options.existing_sys_letter,
+                                                        Some(*ch),
+                                                        desc,
+                                                    );
+                                                }
+                                            }
+                                        });
+
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new("Drive Windows USB:").strong());
+                                            if candidates.is_empty() {
+                                                ui.label(
+                                                    RichText::new("(Tidak ada huruf partisi USB non-C: yang terdeteksi)")
+                                                        .color(warn_color),
+                                                );
+                                            } else {
+                                                for (ch, desc, _, has_win) in &candidates {
+                                                    let label = if *has_win {
+                                                        format!("{} [\\Windows ✓]", desc)
+                                                    } else {
+                                                        desc.clone()
+                                                    };
+                                                    ui.radio_value(
+                                                        &mut self.options.existing_win_letter,
+                                                        Some(*ch),
+                                                        label,
+                                                    );
+                                                }
+                                            }
+                                        });
+
+                                        if self.options.scheme == PartitionScheme::KeepExisting {
+                                            self.options.scheme = PartitionScheme::MbrBiosAndUefi;
+                                        }
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new("Skema Firmware Bootloader:").strong());
+                                            ui.radio_value(
+                                                &mut self.options.scheme,
+                                                PartitionScheme::GptUefi,
+                                                "GPT UEFI",
+                                            );
+                                            ui.radio_value(
+                                                &mut self.options.scheme,
+                                                PartitionScheme::MbrBios,
+                                                "MBR BIOS",
+                                            );
+                                            ui.radio_value(
+                                                &mut self.options.scheme,
+                                                PartitionScheme::MbrBiosAndUefi,
+                                                "MBR BIOS & UEFI Dual Boot",
+                                            );
+                                        });
+
+                                        ui.checkbox(
+                                            &mut self.options.repair_reapply_wtg_tweaks,
+                                            "Terapkan ulang tweak Registry PortableOperatingSystem=1",
+                                        );
+                                    });
+                                }
                             }
                         });
                     }
@@ -931,6 +1200,7 @@ impl eframe::App for WinToUsbApp {
                     }
 
                     let mut has_usb = false;
+                    let mut selected_disk_changed = false;
                     for d in &self.disks {
                         if d.is_safe_usb_target() {
                             has_usb = true;
@@ -950,6 +1220,7 @@ impl eframe::App for WinToUsbApp {
                                     self.options.target_disk_number = d.number;
                                     self.confirm_disk_text.clear();
                                     self.confirm_wipe_checked = false;
+                                    selected_disk_changed = true;
                                 }
 
                                 ui.label(
@@ -1007,6 +1278,13 @@ impl eframe::App for WinToUsbApp {
                                 );
                             }
                         });
+                    }
+
+                    if selected_disk_changed
+                        && self.options.mode == DeployMode::DiskVhdUtility
+                        && self.options.utility_action == UtilityAction::RepairUsbBootloader
+                    {
+                        self.auto_detect_repair_letters();
                     }
 
                     if !has_usb {
@@ -1159,18 +1437,23 @@ impl eframe::App for WinToUsbApp {
                 ui.add_space(4.0);
 
                 ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Label Volume USB:");
-                        let r = ui.add_enabled(
-                            !is_running,
-                            egui::TextEdit::singleline(&mut self.options.volume_label)
-                                .desired_width(180.0),
-                        );
-                        if r.changed() {
-                            self.config.default_volume_label = self.options.volume_label.clone();
-                            self.config.save();
-                        }
-                    });
+                    let is_repair_mode = self.options.mode == DeployMode::DiskVhdUtility
+                        && self.options.utility_action == UtilityAction::RepairUsbBootloader;
+                    if !is_repair_mode {
+                        ui.horizontal(|ui| {
+                            ui.label("Label Volume USB:");
+                            let r = ui.add_enabled(
+                                !is_running,
+                                egui::TextEdit::singleline(&mut self.options.volume_label)
+                                    .desired_width(180.0),
+                            );
+                            if r.changed() {
+                                self.config.default_volume_label =
+                                    self.options.volume_label.clone();
+                                self.config.save();
+                            }
+                        });
+                    }
 
                     if matches!(
                         self.options.mode,
@@ -1309,12 +1592,36 @@ impl eframe::App for WinToUsbApp {
                 ui.add_space(4.0);
 
                 ui.group(|ui| {
+                    let is_repair_mode = self.options.mode == DeployMode::DiskVhdUtility
+                        && self.options.utility_action == UtilityAction::RepairUsbBootloader;
+                    let repair_win_missing = is_repair_mode
+                        && !self
+                            .options
+                            .existing_win_letter
+                            .map(|c| self.detected_windows_drives.contains(&c.to_ascii_uppercase()))
+                            .unwrap_or(false);
+
                     let selected_disk_opt = self.selected_disk().cloned();
-                    let plan_validation = selected_disk_opt.as_ref().ok_or_else(|| {
-                        "Pilih drive USB target yang aman pada Langkah 2.".to_string()
-                    }).and_then(|td| {
-                        build_dry_run_plan(&self.options, td, self.live_os.as_ref(), None).map(|_| td)
-                    });
+                    let plan_validation = selected_disk_opt
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "Pilih drive USB target yang aman pada Langkah 2.".to_string()
+                        })
+                        .and_then(|td| {
+                            build_dry_run_plan(&self.options, td, self.live_os.as_ref(), None)
+                                .map(|_| td)
+                        })
+                        .and_then(|td| {
+                            if repair_win_missing {
+                                let w = self.options.existing_win_letter.unwrap_or('?');
+                                Err(format!(
+                                    "Direktori {}:\\Windows belum ditemukan pada drive terpilih. Pilih Drive Windows USB yang valid atau klik 'Deteksi Otomatis Partisi USB'.",
+                                    w
+                                ))
+                            } else {
+                                Ok(td)
+                            }
+                        });
 
                     let destructive = self.needs_destructive_confirmation();
                     let mut confirmed = !destructive;
@@ -1375,8 +1682,13 @@ impl eframe::App for WinToUsbApp {
 
                             ui.add_space(6.0);
                             let can_start = !is_running && confirmed && self.is_admin;
+                            let action_label = if is_repair_mode {
+                                "🔧 Pasang / Perbaiki Bootloader USB"
+                            } else {
+                                "🚀 Mulai Proses Pembuatan USB"
+                            };
                             let start_btn = egui::Button::new(
-                                RichText::new("🚀 Mulai Proses Pembuatan USB")
+                                RichText::new(action_label)
                                     .size(15.0)
                                     .strong(),
                             )

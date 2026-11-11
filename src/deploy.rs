@@ -48,6 +48,7 @@ pub enum UtilityAction {
     FormatSinglePartition,
     PrepareBootableLayout,
     CreateStandaloneVhdx,
+    RepairUsbBootloader,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,7 @@ pub struct DeployOptions {
     pub utility_use_gpt: bool,
     pub utility_vhdx_target_letter: Option<char>,
     pub utility_vhdx_filename: String,
+    pub repair_reapply_wtg_tweaks: bool,
 }
 
 impl Default for DeployOptions {
@@ -122,6 +124,7 @@ impl Default for DeployOptions {
             utility_use_gpt: true,
             utility_vhdx_target_letter: None,
             utility_vhdx_filename: "WinToGo.vhdx".to_string(),
+            repair_reapply_wtg_tweaks: true,
         }
     }
 }
@@ -182,29 +185,23 @@ impl DeployState {
     }
 }
 
-/// Build deterministic `bcdboot.exe` argument vector per partition scheme.
-pub fn generate_bcdboot_args(
+/// Build deterministic `bcdboot.exe` argument vector for an explicit firmware mode (`/v` always enabled).
+pub fn generate_bcdboot_args_for_fw(
     windows_dir: &str,
     system_letter: char,
-    scheme: PartitionScheme,
+    fw_flag: &str,
 ) -> Result<Vec<String>, String> {
     let win = windows_dir.trim();
     if win.is_empty() {
         return Err("Path direktori Windows untuk BCDBoot tidak boleh kosong.".to_string());
     }
     let sys = system_letter.to_ascii_uppercase();
-    if !('E'..='Z').contains(&sys) {
+    if !('D'..='Z').contains(&sys) {
         return Err(format!(
-            "Huruf drive sistem BCDBoot '{}' tidak valid (harus E-Z).",
+            "Huruf drive sistem BCDBoot '{}' tidak valid (harus D-Z, tidak boleh A/B/C).",
             system_letter
         ));
     }
-
-    let fw_flag = match scheme {
-        PartitionScheme::GptUefi => "UEFI",
-        PartitionScheme::MbrBios => "BIOS",
-        PartitionScheme::MbrBiosAndUefi | PartitionScheme::KeepExisting => "ALL",
-    };
 
     Ok(vec![
         win.to_string(),
@@ -212,7 +209,23 @@ pub fn generate_bcdboot_args(
         format!("{}:", sys),
         "/f".to_string(),
         fw_flag.to_string(),
+        "/v".to_string(),
     ])
+}
+
+/// Build deterministic `bcdboot.exe` argument vector per partition scheme (with `/v` diagnostics).
+pub fn generate_bcdboot_args(
+    windows_dir: &str,
+    system_letter: char,
+    scheme: PartitionScheme,
+) -> Result<Vec<String>, String> {
+    let fw_flag = match scheme {
+        PartitionScheme::GptUefi => "UEFI",
+        PartitionScheme::MbrBios => "BIOS",
+        PartitionScheme::MbrBiosAndUefi | PartitionScheme::KeepExisting => "ALL",
+    };
+
+    generate_bcdboot_args_for_fw(windows_dir, system_letter, fw_flag)
 }
 
 /// Build DISM `/Apply-Image` arguments, including `/SWMFile` for split images.
@@ -329,6 +342,22 @@ pub fn describe_registry_tweaks(opts: &DeployOptions) -> Vec<String> {
             "Menulis autounattend.xml (windowsPE LabConfig Bypass TPM/SecureBoot/RAM/CPU) ke root USB"
                 .to_string(),
         );
+    } else if opts.mode == DeployMode::DiskVhdUtility
+        && opts.utility_action == UtilityAction::RepairUsbBootloader
+        && opts.repair_reapply_wtg_tweaks
+    {
+        tweaks.push(
+            "HKLM\\SYSTEM\\ControlSet001\\Control\\PortableOperatingSystem = 1 (Windows To Go)"
+                .to_string(),
+        );
+        tweaks.push(
+            "HKLM\\SYSTEM\\ControlSet001\\Services\\{USBSTOR,UASPStor,USBXHCI,USBHUB3}\\Start = 0 (Early USB Boot)"
+                .to_string(),
+        );
+        tweaks.push(
+            "HKLM\\SYSTEM\\ControlSet001\\Control\\Power\\HibernateEnabled = 0 (Hemat ruang & umur SSD/USB)"
+                .to_string(),
+        );
     }
     tweaks
 }
@@ -338,13 +367,75 @@ fn validate_keep_existing_letters(opts: &DeployOptions) -> Result<(char, char), 
         .existing_win_letter
         .ok_or("Pilih huruf partisi Windows target untuk mode 'Pertahankan Partisi'.")?
         .to_ascii_uppercase();
-    if !('E'..='Z').contains(&win) {
-        return Err(format!("Huruf partisi Windows '{}' tidak valid (harus E-Z).", win));
+    if win == 'C' || !('D'..='Z').contains(&win) {
+        return Err(format!(
+            "Huruf partisi Windows '{}' tidak valid atau dilindungi (harus D-Z, tidak boleh C:\\).",
+            win
+        ));
     }
     let sys = opts.existing_sys_letter.unwrap_or(win).to_ascii_uppercase();
-    if !('E'..='Z').contains(&sys) {
-        return Err(format!("Huruf partisi Sistem '{}' tidak valid (harus E-Z).", sys));
+    if sys == 'C' || !('D'..='Z').contains(&sys) {
+        return Err(format!(
+            "Huruf partisi Sistem '{}' tidak valid atau dilindungi (harus D-Z, tidak boleh C:\\).",
+            sys
+        ));
     }
+    Ok((sys, win))
+}
+
+/// Validate target drive letters for `UtilityAction::RepairUsbBootloader`.
+/// Strictly rejects `C:\`, floppy/reserved letters, and any letter residing on Disk 0 or a system/boot disk.
+pub fn validate_repair_bootloader_letters(
+    sys_letter: Option<char>,
+    win_letter: Option<char>,
+    scheme: PartitionScheme,
+    disks: &[DiskInfo],
+) -> Result<(char, char), String> {
+    let win = win_letter
+        .ok_or("Pilih huruf drive Windows USB target (yang berisi folder \\Windows).")?
+        .to_ascii_uppercase();
+    if win == 'C' || !('D'..='Z').contains(&win) {
+        return Err(format!(
+            "DIBLOKIR: Huruf drive Windows '{}' tidak valid atau dilindungi (harus D-Z, tidak boleh C:\\).",
+            win
+        ));
+    }
+
+    let sys = match sys_letter {
+        Some(s) => s.to_ascii_uppercase(),
+        None if scheme == PartitionScheme::MbrBios => win,
+        None => {
+            return Err("Pilih huruf drive Sistem (BOOT/EFI) terlebih dahulu.".to_string());
+        }
+    };
+    if sys == 'C' || !('D'..='Z').contains(&sys) {
+        return Err(format!(
+            "DIBLOKIR: Huruf drive Sistem '{}' tidak valid atau dilindungi (harus D-Z, tidak boleh C:\\).",
+            sys
+        ));
+    }
+
+    for d in disks {
+        let disk_protected = d.number == 0
+            || d.is_system
+            || d.is_boot
+            || d.partitions
+                .iter()
+                .any(|p| p.is_system || p.is_boot || p.drive_letter == Some('C'));
+        if disk_protected {
+            for p in &d.partitions {
+                if let Some(ch) = p.drive_letter.map(|c| c.to_ascii_uppercase()) {
+                    if ch == sys || ch == win {
+                        return Err(format!(
+                            "DIBLOKIR: Drive {}:\\ berada pada Disk {} ({}) yang merupakan disk sistem/boot/utama.",
+                            ch, d.number, d.friendly_name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     Ok((sys, win))
 }
 
@@ -365,9 +456,48 @@ pub fn build_dry_run_plan(
     };
 
     // Validate disk safety for all destructive / disk-level operations
-    if opts.mode != DeployMode::DiskVhdUtility
-        || opts.utility_action != UtilityAction::CreateStandaloneVhdx
-    {
+    let is_repair_util = opts.mode == DeployMode::DiskVhdUtility
+        && opts.utility_action == UtilityAction::RepairUsbBootloader;
+    let is_vhdx_util = opts.mode == DeployMode::DiskVhdUtility
+        && opts.utility_action == UtilityAction::CreateStandaloneVhdx;
+
+    if is_repair_util {
+        let has_protected_part = target_disk
+            .partitions
+            .iter()
+            .any(|p| p.is_system || p.is_boot || p.drive_letter == Some('C'));
+        if target_disk.is_system
+            || target_disk.is_boot
+            || target_disk.number == 0
+            || has_protected_part
+        {
+            return Err(format!(
+                "DIBLOKIR: Disk {} ({}) adalah disk sistem/boot/utama.",
+                target_disk.number, target_disk.friendly_name
+            ));
+        }
+        if target_disk.is_read_only {
+            return Err(format!(
+                "Disk {} ({}) dalam status Read-Only (Write Protected).",
+                target_disk.number, target_disk.friendly_name
+            ));
+        }
+        if target_disk.is_offline {
+            return Err(format!(
+                "Disk {} ({}) dalam status Offline.",
+                target_disk.number, target_disk.friendly_name
+            ));
+        }
+        let is_removable_or_virtual = target_disk.bus_type.eq_ignore_ascii_case("USB")
+            || target_disk.bus_type.eq_ignore_ascii_case("FileBackedVirtual")
+            || target_disk.bus_type.eq_ignore_ascii_case("Virtual");
+        if !opts.allow_non_usb_target && !is_removable_or_virtual {
+            return Err(format!(
+                "DIBLOKIR: Disk {} ({}) menggunakan bus '{}' (bukan USB). Aktifkan opsi lanjutan jika benar-benar yakin.",
+                target_disk.number, target_disk.friendly_name, target_disk.bus_type
+            ));
+        }
+    } else if !is_vhdx_util {
         if opts.scheme.is_destructive() || opts.mode == DeployMode::WindowsInstallerUsb {
             validate_target_disk(target_disk, opts.allow_non_usb_target, min_bytes)?;
         } else if target_disk.is_system || target_disk.is_boot || target_disk.number == 0 {
@@ -731,6 +861,60 @@ pub fn build_dry_run_plan(
                     warnings,
                 })
             }
+            UtilityAction::RepairUsbBootloader => {
+                let effective_scheme = if opts.scheme == PartitionScheme::KeepExisting {
+                    PartitionScheme::MbrBiosAndUefi
+                } else {
+                    opts.scheme
+                };
+                let (sys_l, win_l) = validate_repair_bootloader_letters(
+                    opts.existing_sys_letter,
+                    opts.existing_win_letter,
+                    effective_scheme,
+                    std::slice::from_ref(target_disk),
+                )?;
+                let bcd_args = generate_bcdboot_args(
+                    &format!("{}:\\Windows", win_l),
+                    sys_l,
+                    effective_scheme,
+                )?;
+                let bcdboot_command = format!("bcdboot.exe {}", bcd_args.join(" "));
+
+                if !Path::new(&format!("{}:\\Windows", win_l)).is_dir() {
+                    warnings.push(format!(
+                        "Direktori {}:\\Windows belum terdeteksi pada host saat ini; pastikan partisi Windows USB benar sebelum eksekusi.",
+                        win_l
+                    ));
+                }
+
+                summary_steps.push(format!(
+                    "1. Validasi partisi tanpa format ulang (Sistem {}:\\ | Target {}:\\Windows)",
+                    sys_l, win_l
+                ));
+                if opts.repair_reapply_wtg_tweaks {
+                    summary_steps.push(
+                        "2. Terapkan ulang tweak Registry PortableOperatingSystem=1 & driver USB early-boot"
+                            .to_string(),
+                    );
+                }
+                summary_steps.push(format!(
+                    "3. Pasang/perbaiki bootloader ({}) + cascade pemulihan exit 193 otomatis",
+                    bcdboot_command
+                ));
+
+                Ok(DryRunPlan {
+                    summary_steps,
+                    diskpart_script: format!(
+                        "; Tidak memformat atau menghapus partisi (perbaikan bootloader {}:\\ -> {}:\\)\n",
+                        win_l, sys_l
+                    ),
+                    vhdx_script: None,
+                    dism_commands,
+                    bcdboot_command,
+                    registry_tweaks: describe_registry_tweaks(opts),
+                    warnings,
+                })
+            }
         },
     }
 }
@@ -973,6 +1157,58 @@ impl Drop for OfflineHiveGuard {
     }
 }
 
+fn apply_wtg_portable_registry_tweaks_on_guard(
+    guard: &OfflineHiveGuard,
+    state: &Arc<Mutex<DeployState>>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let ctrl_key = format!("{}\\ControlSet001\\Control", guard.sys_key);
+    guard.set_dword(&ctrl_key, "PortableOperatingSystem", 1)?;
+    log_state(
+        state,
+        ctx,
+        LogLevel::Ok,
+        "Registry: PortableOperatingSystem = 1 (Windows To Go aktif).",
+    );
+
+    let pwr_key = format!("{}\\ControlSet001\\Control\\Power", guard.sys_key);
+    let _ = guard.set_dword(&pwr_key, "HibernateEnabled", 0);
+
+    for svc in [
+        "USBSTOR",
+        "UASPStor",
+        "USBXHCI",
+        "USBHUB3",
+        "usbhub",
+        "usbehci",
+        "usbuhci",
+        "usbohci",
+    ] {
+        let svc_key = format!("{}\\ControlSet001\\Services\\{}", guard.sys_key, svc);
+        if guard.key_exists(&svc_key) {
+            let _ = guard.set_dword(&svc_key, "Start", 0);
+        }
+    }
+    log_state(
+        state,
+        ctx,
+        LogLevel::Ok,
+        "Registry: Driver USB Early-Boot (USBSTOR/UASPStor/XHCI) diatur ke Start=0.",
+    );
+    Ok(())
+}
+
+fn apply_wtg_portable_registry_tweaks(
+    win_drive: char,
+    state: &Arc<Mutex<DeployState>>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let mut guard = OfflineHiveGuard::load(win_drive, false)?;
+    apply_wtg_portable_registry_tweaks_on_guard(&guard, state, ctx)?;
+    guard.unload();
+    Ok(())
+}
+
 fn apply_offline_registry_tweaks(
     win_drive: char,
     opts: &DeployOptions,
@@ -986,39 +1222,7 @@ fn apply_offline_registry_tweaks(
     let mut guard = OfflineHiveGuard::load(win_drive, opts.bypass_win11_checks)?;
 
     if opts.enable_wtg_tweaks {
-        let ctrl_key = format!("{}\\ControlSet001\\Control", guard.sys_key);
-        guard.set_dword(&ctrl_key, "PortableOperatingSystem", 1)?;
-        log_state(
-            state,
-            ctx,
-            LogLevel::Ok,
-            "Registry: PortableOperatingSystem = 1 (Windows To Go aktif).",
-        );
-
-        let pwr_key = format!("{}\\ControlSet001\\Control\\Power", guard.sys_key);
-        let _ = guard.set_dword(&pwr_key, "HibernateEnabled", 0);
-
-        for svc in [
-            "USBSTOR",
-            "UASPStor",
-            "USBXHCI",
-            "USBHUB3",
-            "usbhub",
-            "usbehci",
-            "usbuhci",
-            "usbohci",
-        ] {
-            let svc_key = format!("{}\\ControlSet001\\Services\\{}", guard.sys_key, svc);
-            if guard.key_exists(&svc_key) {
-                let _ = guard.set_dword(&svc_key, "Start", 0);
-            }
-        }
-        log_state(
-            state,
-            ctx,
-            LogLevel::Ok,
-            "Registry: Driver USB Early-Boot (USBSTOR/UASPStor/XHCI) diatur ke Start=0.",
-        );
+        apply_wtg_portable_registry_tweaks_on_guard(&guard, state, ctx)?;
     }
 
     if opts.bypass_win11_checks {
@@ -1107,6 +1311,519 @@ fn inject_drivers_if_requested(
     Ok(())
 }
 
+pub const PE_MACHINE_I386: u16 = 0x014c;
+pub const PE_MACHINE_AMD64: u16 = 0x8664;
+pub const PE_MACHINE_ARM64: u16 = 0xAA64;
+
+pub fn pe_machine_label(machine: u16) -> &'static str {
+    match machine {
+        PE_MACHINE_AMD64 => "x64 (AMD64)",
+        PE_MACHINE_I386 => "x86 (I386)",
+        PE_MACHINE_ARM64 => "ARM64",
+        _ => "Unknown",
+    }
+}
+
+/// Read COFF `Machine` field from a Windows PE binary (`MZ` -> `e_lfanew` -> `PE\0\0` -> `Machine`) without executing it.
+pub fn read_pe_machine(path: &Path) -> Option<u16> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < 64 {
+        return None;
+    }
+
+    let mut dos_header = [0u8; 64];
+    file.read_exact(&mut dos_header).ok()?;
+    if &dos_header[0..2] != b"MZ" {
+        return None;
+    }
+
+    let e_lfanew = u32::from_le_bytes([
+        dos_header[0x3C],
+        dos_header[0x3D],
+        dos_header[0x3E],
+        dos_header[0x3F],
+    ]) as u64;
+
+    if e_lfanew < 64 || e_lfanew.checked_add(6)? > file_len {
+        return None;
+    }
+
+    file.seek(SeekFrom::Start(e_lfanew)).ok()?;
+    let mut nt_sig_and_machine = [0u8; 6];
+    file.read_exact(&mut nt_sig_and_machine).ok()?;
+    if &nt_sig_and_machine[0..4] != b"PE\0\0" {
+        return None;
+    }
+
+    Some(u16::from_le_bytes([
+        nt_sig_and_machine[4],
+        nt_sig_and_machine[5],
+    ]))
+}
+
+fn detect_windows_boot_arch(win_dir: &Path) -> Option<u16> {
+    let sys32 = win_dir.join("System32");
+    read_pe_machine(&sys32.join("winload.efi"))
+        .or_else(|| read_pe_machine(&sys32.join("winload.exe")))
+}
+
+pub fn host_windows_dir() -> PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    PathBuf::from(root)
+}
+
+/// Resolve ordered `bcdboot.exe` candidates: target Windows image first, then host Windows System32.
+pub fn resolve_bcdboot_candidates_from_dirs(
+    target_win_dir: &Path,
+    host_win_dir: &Path,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let target_exe = target_win_dir.join("System32").join("bcdboot.exe");
+    if target_exe.is_file() {
+        candidates.push(target_exe.to_string_lossy().to_string());
+    }
+
+    let host_exe = host_win_dir.join("System32").join("bcdboot.exe");
+    if host_exe.is_file() {
+        let host_str = host_exe.to_string_lossy().to_string();
+        if !candidates.iter().any(|c| c.eq_ignore_ascii_case(&host_str)) {
+            candidates.push(host_str);
+        }
+    } else if !candidates.iter().any(|c| c.eq_ignore_ascii_case("bcdboot.exe")) {
+        candidates.push("bcdboot.exe".to_string());
+    }
+
+    candidates
+}
+
+pub fn select_bcdboot_candidates(win_drive: char) -> Vec<String> {
+    let drv = win_drive.to_ascii_uppercase();
+    let target_win = PathBuf::from(format!("{}:\\Windows", drv));
+    let host_win = host_windows_dir();
+    resolve_bcdboot_candidates_from_dirs(&target_win, &host_win)
+}
+
+fn resolve_system_tool(win_dir: &Path, tool_name: &str) -> String {
+    let p = win_dir.join("System32").join(tool_name);
+    if p.is_file() {
+        p.to_string_lossy().to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
+/// Extract `BFSVC:` diagnostic failure lines from `bcdboot.exe /v` stdout/stderr.
+pub fn extract_bfsvc_error_lines(output: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for raw in output.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("bfsvc:") {
+            let looks_err = lower.contains("failed")
+                || lower.contains("error")
+                || lower.contains("checksum")
+                || lower.contains("mismatch")
+                || lower.contains("unable")
+                || lower.contains("cannot")
+                || lower.contains("could not")
+                || lower.contains("denied")
+                || lower.contains("invalid")
+                || lower.contains("missing")
+                || lower.contains("not found")
+                || lower.contains("0xc")
+                || lower.contains("0x8");
+            let is_zero_err = lower.ends_with("error code = 0x0")
+                || lower.contains("error code = 0x0 ");
+            if looks_err && !is_zero_err {
+                lines.push(trimmed.to_string());
+            }
+        }
+    }
+    lines
+}
+
+/// Detect PE checksum / `ERROR_BAD_EXE_FORMAT` (`exit 193` / `0xC1`) failure from `bcdboot`.
+pub fn is_checksum_or_pe_error(exit_code: i32, output: &str) -> bool {
+    if exit_code == 193 {
+        return true;
+    }
+    let lower = output.to_ascii_lowercase();
+    lower.contains("failed to validate boot manager checksum")
+        || lower.contains("validate boot manager checksum")
+        || lower.contains("error code = 0xc1")
+        || lower.contains("0x000000c1")
+        || lower.contains("error_bad_exe_format")
+}
+
+/// Verify `bcdedit.exe /store <bcd> /enum {default}` points both `device` and `osdevice`
+/// to `partition=<win_drive>:` (or `vhd=[...]` when backed by VHDX), never back to host drive.
+pub fn verify_bcd_enum_retargeted(
+    enum_output: &str,
+    win_drive: char,
+    host_drive: char,
+) -> bool {
+    let win_part = format!("partition={}:", win_drive.to_ascii_lowercase());
+    let host_part = format!("partition={}:", host_drive.to_ascii_lowercase());
+
+    let mut saw_device_key = false;
+    let mut saw_osdevice_key = false;
+    let mut device_ok = false;
+    let mut osdevice_ok = false;
+
+    for raw in enum_output.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let key = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let val = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+
+        if key == "device" {
+            saw_device_key = true;
+            device_ok = val == win_part || val.starts_with("vhd=[");
+        } else if key == "osdevice" {
+            saw_osdevice_key = true;
+            osdevice_ok = val == win_part || val.starts_with("vhd=[");
+        }
+    }
+
+    if saw_device_key && saw_osdevice_key {
+        return device_ok && osdevice_ok;
+    }
+
+    // Fallback for localized Windows where field labels are translated
+    let lower = enum_output.to_ascii_lowercase();
+    let has_target = lower.contains(&win_part) || lower.contains("vhd=[");
+    let still_host = win_drive.to_ascii_lowercase() != host_drive.to_ascii_lowercase()
+        && lower.contains(&host_part);
+    has_target && !still_host
+}
+
+struct BcdbootAttemptResult {
+    success: bool,
+    exit_code: i32,
+    combined_output: String,
+    is_checksum_err: bool,
+}
+
+fn run_bcdboot_attempt(
+    bcdboot_exe: &str,
+    args: &[String],
+    state: &Arc<Mutex<DeployState>>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> Result<BcdbootAttemptResult, String> {
+    log_state(
+        state,
+        ctx,
+        LogLevel::Cmd,
+        format!("{} {}", bcdboot_exe, args.join(" ")),
+    );
+
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let cmd_res = crate::disk::run_command_cancellable(bcdboot_exe, &arg_refs, Some(cancel));
+    check_cancelled(cancel)?;
+
+    let (code, stdout, stderr) = match cmd_res {
+        Ok(tuple) => tuple,
+        Err(spawn_err) => {
+            log_state(
+                state,
+                ctx,
+                LogLevel::Warn,
+                format!("Tidak dapat menjalankan '{}': {}", bcdboot_exe, spawn_err),
+            );
+            let is_csum = spawn_err.contains("193")
+                || spawn_err.to_ascii_lowercase().contains("valid win32");
+            return Ok(BcdbootAttemptResult {
+                success: false,
+                exit_code: -1,
+                combined_output: spawn_err,
+                is_checksum_err: is_csum,
+            });
+        }
+    };
+
+    let combined = match (stdout.trim(), stderr.trim()) {
+        ("", "") => String::new(),
+        (o, "") => o.to_string(),
+        ("", e) => e.to_string(),
+        (o, e) => format!("{}\n{}", o, e),
+    };
+
+    if code == 0 {
+        return Ok(BcdbootAttemptResult {
+            success: true,
+            exit_code: 0,
+            combined_output: combined,
+            is_checksum_err: false,
+        });
+    }
+
+    let bfsvc_errors = extract_bfsvc_error_lines(&combined);
+    let is_checksum_err = is_checksum_or_pe_error(code, &combined);
+    let tail = combined
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .last()
+        .unwrap_or("Failure when attempting to copy boot files.");
+
+    log_state(
+        state,
+        ctx,
+        LogLevel::Warn,
+        format!("bcdboot gagal (exit {}): {}", code, tail),
+    );
+    for bf_line in &bfsvc_errors {
+        log_state(state, ctx, LogLevel::Warn, format!("  ↳ {}", bf_line));
+    }
+
+    Ok(BcdbootAttemptResult {
+        success: false,
+        exit_code: code,
+        combined_output: combined,
+        is_checksum_err,
+    })
+}
+
+fn try_bcdboot_candidates(
+    win_dir: &str,
+    sys_drive: char,
+    fw_flag: &str,
+    candidates: &[String],
+    state: &Arc<Mutex<DeployState>>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> Result<(Option<(String, String)>, bool, String), String> {
+    let args = generate_bcdboot_args_for_fw(win_dir, sys_drive, fw_flag)?;
+    let mut saw_checksum_err = false;
+    let mut last_err = String::new();
+
+    for exe in candidates {
+        check_cancelled(cancel)?;
+        let res = run_bcdboot_attempt(exe, &args, state, ctx, cancel)?;
+        if res.success {
+            return Ok((
+                Some((exe.clone(), res.combined_output)),
+                saw_checksum_err,
+                String::new(),
+            ));
+        }
+        saw_checksum_err |= res.is_checksum_err;
+        let bfsvc = extract_bfsvc_error_lines(&res.combined_output);
+        let detail = if !bfsvc.is_empty() {
+            bfsvc.join(" | ")
+        } else {
+            res.combined_output
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .last()
+                .unwrap_or("Gagal menyalin berkas boot.")
+                .to_string()
+        };
+        last_err = format!("{} (exit {}): {}", exe, res.exit_code, detail);
+    }
+
+    Ok((None, saw_checksum_err, last_err))
+}
+
+fn try_run_bootsect_mbr(
+    win_drive: char,
+    sys_drive: char,
+    state: &Arc<Mutex<DeployState>>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) {
+    let target_bs = PathBuf::from(format!("{}:\\Windows\\System32\\bootsect.exe", win_drive));
+    let host_bs = host_windows_dir().join("System32").join("bootsect.exe");
+    let bs_exe = if target_bs.is_file() {
+        Some(target_bs.to_string_lossy().to_string())
+    } else if host_bs.is_file() {
+        Some(host_bs.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    let Some(exe) = bs_exe else {
+        log_state(
+            state,
+            ctx,
+            LogLevel::Warn,
+            "bootsect.exe tidak ditemukan di sistem/image; dilewati (non-fatal, DiskPart sudah menulis PBR/MBR NT60 standar).",
+        );
+        return;
+    };
+
+    let drive_arg = format!("{}:", sys_drive.to_ascii_uppercase());
+    log_state(
+        state,
+        ctx,
+        LogLevel::Cmd,
+        format!("{} /nt60 {} /mbr", exe, drive_arg),
+    );
+    match crate::disk::run_command_cancellable(&exe, &["/nt60", &drive_arg, "/mbr"], Some(cancel))
+    {
+        Ok((0, _, _)) => {
+            log_state(
+                state,
+                ctx,
+                LogLevel::Ok,
+                format!("bootsect.exe /nt60 {} /mbr berhasil memperbarui boot sector MBR.", drive_arg),
+            );
+        }
+        Ok((code, stdout, stderr)) => {
+            log_state(
+                state,
+                ctx,
+                LogLevel::Warn,
+                format!(
+                    "bootsect.exe mengembalikan kode {} (non-fatal): {} {}",
+                    code,
+                    stdout.trim(),
+                    stderr.trim()
+                ),
+            );
+        }
+        Err(e) => {
+            log_state(
+                state,
+                ctx,
+                LogLevel::Warn,
+                format!("bootsect.exe dilewati (non-fatal): {}", e),
+            );
+        }
+    }
+}
+
+fn run_bcdedit_cmd(
+    bcdedit_exe: &str,
+    args: &[&str],
+    state: &Arc<Mutex<DeployState>>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    log_state(
+        state,
+        ctx,
+        LogLevel::Cmd,
+        format!("{} {}", bcdedit_exe, args.join(" ")),
+    );
+    let (code, stdout, stderr) =
+        crate::disk::run_command_cancellable(bcdedit_exe, args, Some(cancel))?;
+    if code != 0 {
+        return Err(format!(
+            "bcdedit.exe gagal (exit {}): {} {}",
+            code,
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+    Ok(stdout)
+}
+
+fn retarget_bcd_store(
+    bcdedit_exe: &str,
+    bcd_path: &str,
+    win_drive: char,
+    sys_drive: char,
+    host_drive: char,
+    state: &Arc<Mutex<DeployState>>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let win_part = format!("partition={}:", win_drive.to_ascii_uppercase());
+    let sys_part = format!("partition={}:", sys_drive.to_ascii_uppercase());
+
+    run_bcdedit_cmd(
+        bcdedit_exe,
+        &["/store", bcd_path, "/set", "{default}", "device", &win_part],
+        state,
+        ctx,
+        cancel,
+    )?;
+    run_bcdedit_cmd(
+        bcdedit_exe,
+        &["/store", bcd_path, "/set", "{default}", "osdevice", &win_part],
+        state,
+        ctx,
+        cancel,
+    )?;
+    run_bcdedit_cmd(
+        bcdedit_exe,
+        &["/store", bcd_path, "/set", "{default}", "detecthal", "Yes"],
+        state,
+        ctx,
+        cancel,
+    )?;
+    run_bcdedit_cmd(
+        bcdedit_exe,
+        &[
+            "/store",
+            bcd_path,
+            "/set",
+            "{default}",
+            "bootmenupolicy",
+            "Standard",
+        ],
+        state,
+        ctx,
+        cancel,
+    )?;
+
+    // Ensure {bootmgr} points to the USB system/EFI partition if needed
+    if let Ok(bm_enum) = run_bcdedit_cmd(
+        bcdedit_exe,
+        &["/store", bcd_path, "/enum", "{bootmgr}"],
+        state,
+        ctx,
+        cancel,
+    ) {
+        let bm_lower = bm_enum.to_ascii_lowercase();
+        let expected_sys = format!("partition={}:", sys_drive.to_ascii_lowercase());
+        if !bm_lower.contains(&expected_sys) {
+            run_bcdedit_cmd(
+                bcdedit_exe,
+                &["/store", bcd_path, "/set", "{bootmgr}", "device", &sys_part],
+                state,
+                ctx,
+                cancel,
+            )?;
+        }
+    }
+
+    let enum_out = run_bcdedit_cmd(
+        bcdedit_exe,
+        &["/store", bcd_path, "/enum", "{default}"],
+        state,
+        ctx,
+        cancel,
+    )?;
+    if !verify_bcd_enum_retargeted(&enum_out, win_drive, host_drive) {
+        return Err(format!(
+            "Verifikasi BCD '{}' gagal: entri {{default}} belum menunjuk ke {}:\\ (output: {}).",
+            bcd_path,
+            win_drive,
+            enum_out.trim()
+        ));
+    }
+
+    log_state(
+        state,
+        ctx,
+        LogLevel::Ok,
+        format!("BCD store '{}' berhasil di-retarget & diverifikasi -> {}:\\", bcd_path, win_drive),
+    );
+    Ok(())
+}
+
 fn install_bootloader(
     win_drive: char,
     sys_drive: char,
@@ -1115,29 +1832,288 @@ fn install_bootloader(
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let win_dir = format!("{}:\\Windows", win_drive);
-    let args = generate_bcdboot_args(&win_dir, sys_drive, scheme)?;
-    log_state(state, ctx, LogLevel::Cmd, format!("bcdboot.exe {}", args.join(" ")));
+    let win_upper = win_drive.to_ascii_uppercase();
+    let sys_upper = sys_drive.to_ascii_uppercase();
+    let win_dir = format!("{}:\\Windows", win_upper);
+    let primary_fw = match scheme {
+        PartitionScheme::GptUefi => "UEFI",
+        PartitionScheme::MbrBios => "BIOS",
+        PartitionScheme::MbrBiosAndUefi | PartitionScheme::KeepExisting => "ALL",
+    };
 
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let (code, stdout, stderr) =
-        crate::disk::run_command_cancellable("bcdboot.exe", &arg_refs, Some(cancel))?;
+    let candidates = select_bcdboot_candidates(win_upper);
 
-    if code != 0 {
-        return Err(format!(
-            "bcdboot.exe gagal (exit {}): {} {}",
-            code,
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-    log_state(
+    // Tier 1: Direct Match (target Windows\System32\bcdboot.exe -> host bcdboot.exe)
+    let (tier1_ok, mut saw_checksum_err, mut last_err) = try_bcdboot_candidates(
+        &win_dir,
+        sys_upper,
+        primary_fw,
+        &candidates,
         state,
         ctx,
-        LogLevel::Ok,
-        format!("Bootloader berhasil dipasang di {}:\\ ({}).", sys_drive, stdout.trim()),
-    );
-    Ok(())
+        cancel,
+    )?;
+
+    if let Some((used_exe, _)) = tier1_ok {
+        log_state(
+            state,
+            ctx,
+            LogLevel::Ok,
+            format!(
+                "Bootloader berhasil dipasang di {}:\\ menggunakan '{}' (mode /f {}).",
+                sys_upper, used_exe, primary_fw
+            ),
+        );
+        if matches!(
+            scheme,
+            PartitionScheme::MbrBios | PartitionScheme::MbrBiosAndUefi
+        ) {
+            try_run_bootsect_mbr(win_upper, sys_upper, state, ctx, cancel);
+        }
+        return Ok(());
+    }
+
+    // Tier 2: Split Fallback when scheme requested /f ALL
+    if primary_fw == "ALL" {
+        log_state(
+            state,
+            ctx,
+            LogLevel::Info,
+            "Mode /f ALL gagal; mencoba pemasangan bootloader terpisah (/f UEFI lalu /f BIOS)...",
+        );
+
+        let (uefi_ok, uefi_csum, uefi_err) = try_bcdboot_candidates(
+            &win_dir,
+            sys_upper,
+            "UEFI",
+            &candidates,
+            state,
+            ctx,
+            cancel,
+        )?;
+        let (bios_ok, bios_csum, bios_err) = try_bcdboot_candidates(
+            &win_dir,
+            sys_upper,
+            "BIOS",
+            &candidates,
+            state,
+            ctx,
+            cancel,
+        )?;
+        saw_checksum_err |= uefi_csum || bios_csum;
+
+        match (uefi_ok, bios_ok) {
+            (Some(_), Some(_)) => {
+                try_run_bootsect_mbr(win_upper, sys_upper, state, ctx, cancel);
+                log_state(
+                    state,
+                    ctx,
+                    LogLevel::Ok,
+                    format!(
+                        "Bootloader Dual-Boot (UEFI & Legacy BIOS) berhasil dipasang di {}:\\ (mode terpisah).",
+                        sys_upper
+                    ),
+                );
+                return Ok(());
+            }
+            (Some(_), None) => {
+                log_state(
+                    state,
+                    ctx,
+                    LogLevel::Warn,
+                    "Bootloader UEFI berhasil dipasang (EFI\\Microsoft\\Boot\\BCD & EFI\\Boot\\bootx64.efi), tetapi mode Legacy BIOS dilewati karena bootmgr PCAT gagal validasi/tidak tersedia. USB tetap 100% bisa booting di PC UEFI!",
+                );
+                return Ok(());
+            }
+            (None, Some(_)) => {
+                try_run_bootsect_mbr(win_upper, sys_upper, state, ctx, cancel);
+                log_state(
+                    state,
+                    ctx,
+                    LogLevel::Warn,
+                    "Bootloader Legacy BIOS berhasil dipasang (Boot\\BCD), tetapi mode UEFI gagal. USB tetap bisa booting di PC Legacy BIOS/CSM!",
+                );
+                return Ok(());
+            }
+            (None, None) => {
+                last_err = format!("UEFI: [{}] | BIOS: [{}]", uefi_err, bios_err);
+            }
+        }
+    }
+
+    // Tier 3: Custom/Modified ISO Host-Boot + BCD Retarget Rescue on Exit 193 / checksum mismatch
+    if saw_checksum_err {
+        let host_win = host_windows_dir();
+        let target_win = PathBuf::from(&win_dir);
+        let host_arch = detect_windows_boot_arch(&host_win);
+        let target_arch = detect_windows_boot_arch(&target_win);
+
+        match (host_arch, target_arch) {
+            (Some(ha), Some(ta)) if ha == ta => {
+                log_state(
+                    state,
+                    ctx,
+                    LogLevel::Warn,
+                    "File boot bawaan dari image sumber gagal validasi checksum (exit 193 — umum pada ISO modifikasi/versi beda). Menjalankan pemulihan otomatis menggunakan boot manager sistem host & me-retarget BCD ke partisi Windows target...",
+                );
+                log_state(
+                    state,
+                    ctx,
+                    LogLevel::Info,
+                    format!(
+                        "Verifikasi arsitektur PE cocok: Host={} (0x{:04X}), Target={} (0x{:04X}).",
+                        pe_machine_label(ha),
+                        ha,
+                        pe_machine_label(ta),
+                        ta
+                    ),
+                );
+
+                let host_win_str = host_win.to_string_lossy().to_string();
+                let host_bcdboot = vec![resolve_system_tool(&host_win, "bcdboot.exe")];
+                let (t3_direct, _, t3_err) = try_bcdboot_candidates(
+                    &host_win_str,
+                    sys_upper,
+                    primary_fw,
+                    &host_bcdboot,
+                    state,
+                    ctx,
+                    cancel,
+                )?;
+
+                let (t3_uefi_ok, t3_bios_ok, tier3_fail_msg) = if t3_direct.is_some() {
+                    (
+                        primary_fw == "UEFI" || primary_fw == "ALL",
+                        primary_fw == "BIOS" || primary_fw == "ALL",
+                        String::new(),
+                    )
+                } else if primary_fw == "ALL" {
+                    let (u_ok, _, u_err) = try_bcdboot_candidates(
+                        &host_win_str,
+                        sys_upper,
+                        "UEFI",
+                        &host_bcdboot,
+                        state,
+                        ctx,
+                        cancel,
+                    )?;
+                    let (b_ok, _, b_err) = try_bcdboot_candidates(
+                        &host_win_str,
+                        sys_upper,
+                        "BIOS",
+                        &host_bcdboot,
+                        state,
+                        ctx,
+                        cancel,
+                    )?;
+                    (
+                        u_ok.is_some(),
+                        b_ok.is_some(),
+                        format!("UEFI: [{}] | BIOS: [{}]", u_err, b_err),
+                    )
+                } else {
+                    (false, false, t3_err)
+                };
+
+                if !t3_uefi_ok && !t3_bios_ok {
+                    return Err(format!(
+                        "Pemulihan bootloader menggunakan host gagal: {}",
+                        tier3_fail_msg
+                    ));
+                }
+
+                let mut bcd_stores = Vec::new();
+                if t3_uefi_ok {
+                    let p = format!("{}:\\EFI\\Microsoft\\Boot\\BCD", sys_upper);
+                    if Path::new(&p).is_file() {
+                        bcd_stores.push(p);
+                    }
+                }
+                if t3_bios_ok {
+                    let p = format!("{}:\\Boot\\BCD", sys_upper);
+                    if Path::new(&p).is_file() {
+                        bcd_stores.push(p);
+                    }
+                }
+
+                if bcd_stores.is_empty() {
+                    return Err(format!(
+                        "bcdboot.exe host selesai tetapi berkas BCD tidak ditemukan di {}:\\EFI\\Microsoft\\Boot\\BCD maupun {}:\\Boot\\BCD.",
+                        sys_upper, sys_upper
+                    ));
+                }
+
+                let bcdedit_exe = resolve_system_tool(&host_win, "bcdedit.exe");
+                let host_drive_ch = host_win_str.chars().next().unwrap_or('C');
+                for bcd_path in &bcd_stores {
+                    retarget_bcd_store(
+                        &bcdedit_exe,
+                        bcd_path,
+                        win_upper,
+                        sys_upper,
+                        host_drive_ch,
+                        state,
+                        ctx,
+                        cancel,
+                    )?;
+                }
+
+                if t3_bios_ok
+                    && matches!(
+                        scheme,
+                        PartitionScheme::MbrBios | PartitionScheme::MbrBiosAndUefi
+                    )
+                {
+                    try_run_bootsect_mbr(win_upper, sys_upper, state, ctx, cancel);
+                }
+
+                if primary_fw == "ALL" {
+                    if t3_uefi_ok && !t3_bios_ok {
+                        log_state(
+                            state,
+                            ctx,
+                            LogLevel::Warn,
+                            "Bootloader UEFI berhasil dipasang (EFI\\Microsoft\\Boot\\BCD & EFI\\Boot\\bootx64.efi), tetapi mode Legacy BIOS dilewati karena bootmgr PCAT gagal validasi/tidak tersedia. USB tetap 100% bisa booting di PC UEFI!",
+                        );
+                    } else if !t3_uefi_ok && t3_bios_ok {
+                        log_state(
+                            state,
+                            ctx,
+                            LogLevel::Warn,
+                            "Bootloader Legacy BIOS berhasil dipasang (Boot\\BCD), tetapi mode UEFI gagal. USB tetap bisa booting di PC Legacy BIOS/CSM!",
+                        );
+                    }
+                }
+
+                log_state(
+                    state,
+                    ctx,
+                    LogLevel::Ok,
+                    format!(
+                        "Pemulihan bootloader host + retarget BCD ke {}:\\ berhasil diverifikasi.",
+                        win_upper
+                    ),
+                );
+                return Ok(());
+            }
+            (Some(ha), Some(ta)) => {
+                return Err(format!(
+                    "bcdboot.exe gagal validasi checksum (exit 193) dan pemulihan host dibatalkan karena arsitektur tidak cocok (Host={}, Target={}): {}",
+                    pe_machine_label(ha),
+                    pe_machine_label(ta),
+                    last_err
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "bcdboot.exe gagal validasi checksum (exit 193) dan arsitektur PE winload.efi/winload.exe tidak dapat diverifikasi untuk pemulihan host: {}",
+                    last_err
+                ));
+            }
+        }
+    }
+
+    Err(format!("bcdboot.exe gagal memasang bootloader: {}", last_err))
 }
 
 fn run_deployment_inner(
@@ -1161,7 +2137,9 @@ fn run_deployment_inner(
         DeployMode::WindowsToGo => execute_wtg_pipeline(opts, target_disk, state, ctx, cancel),
         DeployMode::LiveOsClone => execute_live_clone_pipeline(opts, target_disk, state, ctx, cancel),
         DeployMode::WindowsInstallerUsb => execute_installer_pipeline(opts, target_disk, state, ctx, cancel),
-        DeployMode::DiskVhdUtility => execute_utility_pipeline(opts, target_disk, state, ctx, cancel),
+        DeployMode::DiskVhdUtility => {
+            execute_utility_pipeline(opts, target_disk, &disks, state, ctx, cancel)
+        }
     }
 }
 
@@ -1264,77 +2242,83 @@ fn execute_wtg_pipeline(
         SourceKind::CurrentOs => return Err("Gunakan mode Live Clone untuk OS aktif.".to_string()),
     };
 
-    check_cancelled(cancel)?;
-    set_step(state, ctx, 3, 6, "Mempersiapkan partisi disk USB target", 15.0);
-    let (sys_l, outer_win_l) =
-        prepare_target_partitions(opts, target_disk, MIN_WTG_DISK_BYTES, state, ctx, cancel)?;
-
     let mut vhdx_guard: Option<VhdxAttachGuard> = None;
-    let apply_letter = if kind == SourceKind::VhdVhdx {
-        set_step(state, ctx, 4, 6, "Menyalin virtual disk VHD/VHDX ke USB", 25.0);
-        let dest_vhd = format!("{}:\\WinToGo.vhdx", outer_win_l);
-        log_state(
-            state,
-            ctx,
-            LogLevel::Info,
-            format!("Menyalin '{}' -> '{}'...", opts.source_path, dest_vhd),
-        );
-        fs::copy(&opts.source_path, &dest_vhd)
-            .map_err(|e| format!("Gagal menyalin berkas VHD/VHDX: {}", e))?;
-        let free = find_free_drive_letters(1, None)?;
-        let inner = free[0];
-        let guard = VhdxAttachGuard::attach_existing_and_assign(&dest_vhd, inner, Some(cancel))?;
-        // Wait for volume mount
-        std::thread::sleep(Duration::from_millis(800));
-        vhdx_guard = Some(guard);
-        inner
-    } else if opts.use_vhdx {
+    let pipeline_res: Result<(), String> = (|| {
         check_cancelled(cancel)?;
-        set_step(state, ctx, 3, 6, "Membuat & attach virtual disk .VHDX", 20.0);
-        let free = find_free_drive_letters(1, None)?;
-        let inner = free[0];
-        let cfg = VhdxConfig {
-            vhd_path: format!("{}:\\WinToGo.vhdx", outer_win_l),
-            size_gb: opts.vhdx_size_gb,
-            expandable: opts.vhdx_dynamic,
-            label: opts.volume_label.clone(),
+        set_step(state, ctx, 3, 6, "Mempersiapkan partisi disk USB target", 15.0);
+        let (sys_l, outer_win_l) =
+            prepare_target_partitions(opts, target_disk, MIN_WTG_DISK_BYTES, state, ctx, cancel)?;
+
+        let apply_letter = if kind == SourceKind::VhdVhdx {
+            set_step(state, ctx, 4, 6, "Menyalin virtual disk VHD/VHDX ke USB", 25.0);
+            let dest_vhd = format!("{}:\\WinToGo.vhdx", outer_win_l);
+            log_state(
+                state,
+                ctx,
+                LogLevel::Info,
+                format!("Menyalin '{}' -> '{}'...", opts.source_path, dest_vhd),
+            );
+            fs::copy(&opts.source_path, &dest_vhd)
+                .map_err(|e| format!("Gagal menyalin berkas VHD/VHDX: {}", e))?;
+            let free = find_free_drive_letters(1, None)?;
+            let inner = free[0];
+            let guard = VhdxAttachGuard::attach_existing_and_assign(&dest_vhd, inner, Some(cancel))?;
+            // Wait for volume mount
+            std::thread::sleep(Duration::from_millis(800));
+            vhdx_guard = Some(guard);
+            inner
+        } else if opts.use_vhdx {
+            check_cancelled(cancel)?;
+            set_step(state, ctx, 3, 6, "Membuat & attach virtual disk .VHDX", 20.0);
+            let free = find_free_drive_letters(1, None)?;
+            let inner = free[0];
+            let cfg = VhdxConfig {
+                vhd_path: format!("{}:\\WinToGo.vhdx", outer_win_l),
+                size_gb: opts.vhdx_size_gb,
+                expandable: opts.vhdx_dynamic,
+                label: opts.volume_label.clone(),
+            };
+            validate_vhdx_config(&cfg, None)?;
+            let (guard, _) = VhdxAttachGuard::create_and_attach(&cfg, inner, Some(cancel))?;
+            std::thread::sleep(Duration::from_millis(800));
+            vhdx_guard = Some(guard);
+            log_state(
+                state,
+                ctx,
+                LogLevel::Ok,
+                format!(
+                    "VHDX siap di {}:\\WinToGo.vhdx (dimount sebagai {}:\\).",
+                    outer_win_l, inner
+                ),
+            );
+            inner
+        } else {
+            outer_win_l
         };
-        validate_vhdx_config(&cfg, None)?;
-        let (guard, _) = VhdxAttachGuard::create_and_attach(&cfg, inner, Some(cancel))?;
-        std::thread::sleep(Duration::from_millis(800));
-        vhdx_guard = Some(guard);
-        log_state(
-            state,
-            ctx,
-            LogLevel::Ok,
-            format!("VHDX siap di {}:\\WinToGo.vhdx (dimount sebagai {}:\\).", outer_win_l, inner),
-        );
-        inner
-    } else {
-        outer_win_l
-    };
 
-    if kind != SourceKind::VhdVhdx {
+        if kind != SourceKind::VhdVhdx {
+            check_cancelled(cancel)?;
+            set_step(state, ctx, 4, 6, "Menerapkan image Windows (DISM /Apply-Image)", 22.0);
+            let apply_args = generate_dism_apply_args(
+                &wim_path,
+                opts.wim_index,
+                &format!("{}:\\", apply_letter),
+                is_swm,
+            );
+            run_dism_with_progress(&apply_args, 22.0, 62.0, state, ctx, cancel)?;
+            log_state(state, ctx, LogLevel::Ok, "Image Windows berhasil diterapkan.");
+        }
+
         check_cancelled(cancel)?;
-        set_step(state, ctx, 4, 6, "Menerapkan image Windows (DISM /Apply-Image)", 22.0);
-        let apply_args = generate_dism_apply_args(
-            &wim_path,
-            opts.wim_index,
-            &format!("{}:\\", apply_letter),
-            is_swm,
-        );
-        run_dism_with_progress(&apply_args, 22.0, 62.0, state, ctx, cancel)?;
-        log_state(state, ctx, LogLevel::Ok, "Image Windows berhasil diterapkan.");
-    }
+        set_step(state, ctx, 5, 6, "Konfigurasi Registry Windows To Go & Driver", 86.0);
+        inject_drivers_if_requested(apply_letter, opts, state, ctx, cancel)?;
+        apply_offline_registry_tweaks(apply_letter, opts, state, ctx)?;
 
-    check_cancelled(cancel)?;
-    set_step(state, ctx, 5, 6, "Konfigurasi Registry Windows To Go & Driver", 86.0);
-    inject_drivers_if_requested(apply_letter, opts, state, ctx, cancel)?;
-    apply_offline_registry_tweaks(apply_letter, opts, state, ctx)?;
-
-    check_cancelled(cancel)?;
-    set_step(state, ctx, 6, 6, "Memasang bootloader Windows (BCDBoot)", 92.0);
-    install_bootloader(apply_letter, sys_l, opts.scheme, state, ctx, cancel)?;
+        check_cancelled(cancel)?;
+        set_step(state, ctx, 6, 6, "Memasang bootloader Windows (BCDBoot)", 92.0);
+        install_bootloader(apply_letter, sys_l, opts.scheme, state, ctx, cancel)?;
+        Ok(())
+    })();
 
     if let Some(mut g) = vhdx_guard {
         let _ = g.detach();
@@ -1345,6 +2329,7 @@ fn execute_wtg_pipeline(
         log_state(state, ctx, LogLevel::Info, "ISO dilepas (dismount) secara bersih.");
     }
 
+    pipeline_res?;
     set_step(state, ctx, 6, 6, "Selesai! Windows To Go siap digunakan.", 100.0);
     Ok(())
 }
@@ -1470,41 +2455,48 @@ fn execute_live_clone_pipeline(
     };
 
     let mut vhdx_guard: Option<VhdxAttachGuard> = None;
-    let apply_letter = if opts.use_vhdx {
-        let free = find_free_drive_letters(1, None)?;
-        let inner = free[0];
-        let cfg = VhdxConfig {
-            vhd_path: format!("{}:\\WinToGo.vhdx", outer_win_l),
-            size_gb: opts.vhdx_size_gb,
-            expandable: opts.vhdx_dynamic,
-            label: opts.volume_label.clone(),
+    let clone_apply_res: Result<(), String> = (|| {
+        let apply_letter = if opts.use_vhdx {
+            let free = find_free_drive_letters(1, None)?;
+            let inner = free[0];
+            let cfg = VhdxConfig {
+                vhd_path: format!("{}:\\WinToGo.vhdx", outer_win_l),
+                size_gb: opts.vhdx_size_gb,
+                expandable: opts.vhdx_dynamic,
+                label: opts.volume_label.clone(),
+            };
+            let (guard, _) = VhdxAttachGuard::create_and_attach(&cfg, inner, Some(cancel))?;
+            std::thread::sleep(Duration::from_millis(800));
+            vhdx_guard = Some(guard);
+            inner
+        } else {
+            outer_win_l
         };
-        let (guard, _) = VhdxAttachGuard::create_and_attach(&cfg, inner, Some(cancel))?;
-        std::thread::sleep(Duration::from_millis(800));
-        vhdx_guard = Some(guard);
-        inner
-    } else {
-        outer_win_l
-    };
 
-    let apply_args = generate_dism_apply_args(&wim_str, 1, &format!("{}:\\", apply_letter), false);
-    let apply_res = run_dism_with_progress(&apply_args, 55.0, 33.0, state, ctx, cancel);
+        let apply_args =
+            generate_dism_apply_args(&wim_str, 1, &format!("{}:\\", apply_letter), false);
+        let apply_res = run_dism_with_progress(&apply_args, 55.0, 33.0, state, ctx, cancel);
+        let _ = fs::remove_file(&wim_temp_path);
+        apply_res?;
+
+        check_cancelled(cancel)?;
+        set_step(state, ctx, 5, 6, "Konfigurasi Registry Windows To Go", 90.0);
+        inject_drivers_if_requested(apply_letter, opts, state, ctx, cancel)?;
+        apply_offline_registry_tweaks(apply_letter, opts, state, ctx)?;
+
+        check_cancelled(cancel)?;
+        set_step(state, ctx, 6, 6, "Memasang bootloader Windows (BCDBoot)", 95.0);
+        install_bootloader(apply_letter, sys_l, opts.scheme, state, ctx, cancel)?;
+        Ok(())
+    })();
+
     let _ = fs::remove_file(&wim_temp_path);
-    apply_res?;
-
-    check_cancelled(cancel)?;
-    set_step(state, ctx, 5, 6, "Konfigurasi Registry Windows To Go", 90.0);
-    inject_drivers_if_requested(apply_letter, opts, state, ctx, cancel)?;
-    apply_offline_registry_tweaks(apply_letter, opts, state, ctx)?;
-
-    check_cancelled(cancel)?;
-    set_step(state, ctx, 6, 6, "Memasang bootloader Windows (BCDBoot)", 95.0);
-    install_bootloader(apply_letter, sys_l, opts.scheme, state, ctx, cancel)?;
-
     if let Some(mut g) = vhdx_guard {
         let _ = g.detach();
+        log_state(state, ctx, LogLevel::Info, "VHDX dilepas (detach) secara bersih.");
     }
 
+    clone_apply_res?;
     set_step(state, ctx, 6, 6, "Selesai! Kloning Windows OS siap booting.", 100.0);
     Ok(())
 }
@@ -1661,6 +2653,7 @@ fn execute_installer_pipeline(
 fn execute_utility_pipeline(
     opts: &DeployOptions,
     target_disk: &DiskInfo,
+    disks: &[DiskInfo],
     state: &Arc<Mutex<DeployState>>,
     ctx: &egui::Context,
     cancel: &AtomicBool,
@@ -1740,6 +2733,90 @@ fn execute_utility_pipeline(
                 2,
                 2,
                 format!("Selesai! Virtual disk '{}' berhasil dibuat.", vhd_path),
+                100.0,
+            );
+            Ok(())
+        }
+        UtilityAction::RepairUsbBootloader => {
+            let effective_scheme = if opts.scheme == PartitionScheme::KeepExisting {
+                PartitionScheme::MbrBiosAndUefi
+            } else {
+                opts.scheme
+            };
+            let total_steps = if opts.repair_reapply_wtg_tweaks { 3 } else { 2 };
+            set_step(
+                state,
+                ctx,
+                1,
+                total_steps,
+                "Validasi partisi Windows USB & Sistem",
+                15.0,
+            );
+
+            if target_disk.number == 0 || target_disk.is_system || target_disk.is_boot {
+                return Err(format!(
+                    "DIBLOKIR: Disk {} ({}) adalah disk sistem/boot/utama.",
+                    target_disk.number, target_disk.friendly_name
+                ));
+            }
+
+            let (sys_l, win_l) = validate_repair_bootloader_letters(
+                opts.existing_sys_letter,
+                opts.existing_win_letter,
+                effective_scheme,
+                disks,
+            )?;
+
+            let win_dir = format!("{}:\\Windows", win_l);
+            if !Path::new(&win_dir).is_dir() {
+                return Err(format!(
+                    "Direktori '{}' tidak ditemukan! Pastikan huruf Drive Windows USB benar dan berisi instalasi Windows.",
+                    win_dir
+                ));
+            }
+            log_state(
+                state,
+                ctx,
+                LogLevel::Ok,
+                format!(
+                    "Partisi valid tanpa format: Sistem={}:\\ | Target Windows={}",
+                    sys_l, win_dir
+                ),
+            );
+
+            if opts.repair_reapply_wtg_tweaks {
+                check_cancelled(cancel)?;
+                set_step(
+                    state,
+                    ctx,
+                    2,
+                    total_steps,
+                    "Menerapkan ulang tweak Registry PortableOperatingSystem=1",
+                    45.0,
+                );
+                apply_wtg_portable_registry_tweaks(win_l, state, ctx)?;
+            }
+
+            check_cancelled(cancel)?;
+            set_step(
+                state,
+                ctx,
+                total_steps,
+                total_steps,
+                "Memasang / memperbaiki bootloader USB (BCDBoot Cascade)",
+                75.0,
+            );
+            install_bootloader(win_l, sys_l, effective_scheme, state, ctx, cancel)?;
+
+            set_step(
+                state,
+                ctx,
+                total_steps,
+                total_steps,
+                format!(
+                    "Selesai! Bootloader USB pada {}:\\ berhasil dipasang/diperbaiki.",
+                    sys_l
+                ),
                 100.0,
             );
             Ok(())

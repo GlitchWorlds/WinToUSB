@@ -1,6 +1,6 @@
 [package]
 name = "wintousb"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["GlitchWorlds"]
 description = "Native Rust Windows To Go Creator, Live OS Hot-Cloner & Bootable USB Suite"

@@ -1,5 +1,11 @@
+use std::fs;
+use std::path::Path;
+
 use crate::deploy::{
-    build_dry_run_plan, generate_bcdboot_args, generate_dism_apply_args, DeployMode, DeployOptions,
+    build_dry_run_plan, extract_bfsvc_error_lines, generate_bcdboot_args, generate_dism_apply_args,
+    is_checksum_or_pe_error, read_pe_machine, resolve_bcdboot_candidates_from_dirs,
+    select_bcdboot_candidates, verify_bcd_enum_retargeted, DeployMode, DeployOptions,
+    UtilityAction, PE_MACHINE_AMD64, PE_MACHINE_ARM64,
 };
 use crate::disk::{
     encode_powershell_command, enumerate_disks, find_free_drive_letters, generate_diskpart_script,
@@ -303,15 +309,15 @@ fn test_generate_vhdx_script_and_validation() {
 fn test_bcdboot_command_generation_modes() {
     let uefi = generate_bcdboot_args("Y:\\Windows", 'Z', PartitionScheme::GptUefi)
         .expect("UEFI BCDBoot args");
-    assert_eq!(uefi, vec!["Y:\\Windows", "/s", "Z:", "/f", "UEFI"]);
+    assert_eq!(uefi, vec!["Y:\\Windows", "/s", "Z:", "/f", "UEFI", "/v"]);
 
     let bios = generate_bcdboot_args("Y:\\Windows", 'Y', PartitionScheme::MbrBios)
         .expect("BIOS BCDBoot args");
-    assert_eq!(bios, vec!["Y:\\Windows", "/s", "Y:", "/f", "BIOS"]);
+    assert_eq!(bios, vec!["Y:\\Windows", "/s", "Y:", "/f", "BIOS", "/v"]);
 
     let dual = generate_bcdboot_args("Y:\\Windows", 'Z', PartitionScheme::MbrBiosAndUefi)
         .expect("Dual boot BCDBoot args");
-    assert_eq!(dual, vec!["Y:\\Windows", "/s", "Z:", "/f", "ALL"]);
+    assert_eq!(dual, vec!["Y:\\Windows", "/s", "Z:", "/f", "ALL", "/v"]);
 
     // C: is protected and must be rejected
     assert!(generate_bcdboot_args("Y:\\Windows", 'C', PartitionScheme::GptUefi).is_err());
@@ -353,7 +359,7 @@ fn test_dry_run_plan_generation_no_side_effects() {
     assert!(plan.diskpart_script.contains("convert mbr"));
     assert!(plan.vhdx_script.as_ref().unwrap().contains("WinToGo.vhdx"));
     assert!(plan.dism_commands.iter().any(|c| c.contains("/Apply-Image") && c.contains("/Index:6")));
-    assert!(plan.bcdboot_command.contains("X:\\Windows /s Z: /f ALL"));
+    assert!(plan.bcdboot_command.contains("X:\\Windows /s Z: /f ALL /v"));
     assert!(plan
         .registry_tweaks
         .iter()
@@ -402,4 +408,197 @@ fn test_parse_single_disk_object_and_numeric_bus() {
 
     // Also sanity-check UTF-16LE base64 encoder
     assert_eq!(encode_powershell_command("hi"), "aABpAA==");
+}
+
+#[test]
+fn test_extract_bfsvc_error_lines() {
+    let sample = "\
+BFSVC: ServiceBootFiles Mui = 0
+BFSVC: Copying boot files from Y:\\Windows\\boot\\EFI to Z:\\EFI\\Microsoft\\Boot\\
+BFSVC: Failed to validate boot manager checksum (Y:\\Windows\\Boot\\PCAT\\bootmgr)! Error code = 0xc1
+BFSVC: Servicing boot files failed. Error code = 0xc1
+BFSVC: Non-error status Error code = 0x0
+Failure when attempting to copy boot files.
+";
+
+    let extracted = extract_bfsvc_error_lines(sample);
+    assert_eq!(extracted.len(), 2);
+    assert!(extracted[0].contains("Failed to validate boot manager checksum"));
+    assert!(extracted[1].contains("Servicing boot files failed"));
+    assert!(is_checksum_or_pe_error(193, sample));
+    assert!(is_checksum_or_pe_error(1, sample));
+    assert!(!is_checksum_or_pe_error(5, "BFSVC: Access denied."));
+}
+
+#[test]
+fn test_read_pe_machine_self_executable() {
+    let exe_path = std::env::current_exe().expect("current_exe should resolve");
+    assert_eq!(read_pe_machine(&exe_path), Some(PE_MACHINE_AMD64));
+
+    assert_eq!(
+        read_pe_machine(Path::new("nonexistent_wintousb_binary_12345.exe")),
+        None
+    );
+
+    let tmp_dir = std::env::temp_dir().join(format!("wintousb_pe_test_{}", std::process::id()));
+    let _ = fs::create_dir_all(&tmp_dir);
+
+    let non_pe = tmp_dir.join("not_pe.bin");
+    fs::write(&non_pe, b"NOT_A_PE_FILE_1234567890_PADDING_BYTES_000000000000000000000000000000").unwrap();
+    assert_eq!(read_pe_machine(&non_pe), None);
+
+    // Construct minimal synthetic ARM64 PE header
+    let mut synth = vec![0u8; 0x90];
+    synth[0] = b'M';
+    synth[1] = b'Z';
+    let pe_off: u32 = 0x80;
+    synth[0x3C..0x40].copy_from_slice(&pe_off.to_le_bytes());
+    synth[0x80..0x84].copy_from_slice(b"PE\0\0");
+    synth[0x84..0x86].copy_from_slice(&PE_MACHINE_ARM64.to_le_bytes());
+    let arm_pe = tmp_dir.join("arm64.efi");
+    fs::write(&arm_pe, &synth).unwrap();
+    assert_eq!(read_pe_machine(&arm_pe), Some(PE_MACHINE_ARM64));
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_dry_run_repair_bootloader_no_wipe_and_blocks_c_drive() {
+    let usb_disk = make_disk(
+        2,
+        "USB",
+        512,
+        false,
+        false,
+        vec![
+            PartitionInfo {
+                disk_number: 2,
+                partition_number: 1,
+                drive_letter: Some('Z'),
+                size_bytes: 300 * 1024 * 1024,
+                part_type: "Basic".to_string(),
+                file_system: "FAT32".to_string(),
+                label: "BOOT".to_string(),
+                is_boot: false,
+                is_system: false,
+                is_active: true,
+            },
+            PartitionInfo {
+                disk_number: 2,
+                partition_number: 2,
+                drive_letter: Some('Y'),
+                size_bytes: 500 * 1024 * 1024 * 1024,
+                part_type: "Basic".to_string(),
+                file_system: "NTFS".to_string(),
+                label: "WinToUSB".to_string(),
+                is_boot: false,
+                is_system: false,
+                is_active: false,
+            },
+        ],
+    );
+
+    let mut opts = DeployOptions::default();
+    opts.mode = DeployMode::DiskVhdUtility;
+    opts.utility_action = UtilityAction::RepairUsbBootloader;
+    opts.target_disk_number = 2;
+    opts.scheme = PartitionScheme::MbrBiosAndUefi;
+    opts.existing_sys_letter = Some('Z');
+    opts.existing_win_letter = Some('Y');
+    opts.repair_reapply_wtg_tweaks = true;
+
+    let plan = build_dry_run_plan(&opts, &usb_disk, None, Some(&['Z', 'Y', 'X']))
+        .expect("Repair bootloader dry-run plan should succeed");
+
+    assert!(plan.diskpart_script.contains("Tidak memformat"));
+    assert!(!plan.diskpart_script.to_ascii_lowercase().contains("clean"));
+    assert_eq!(plan.bcdboot_command, "bcdboot.exe Y:\\Windows /s Z: /f ALL /v");
+    assert!(plan
+        .registry_tweaks
+        .iter()
+        .any(|t| t.contains("PortableOperatingSystem = 1")));
+
+    // Reject C:\ as Windows target
+    let mut bad_win = opts.clone();
+    bad_win.existing_win_letter = Some('C');
+    assert!(build_dry_run_plan(&bad_win, &usb_disk, None, None).is_err());
+
+    // Reject C:\ as System target
+    let mut bad_sys = opts.clone();
+    bad_sys.existing_sys_letter = Some('C');
+    assert!(build_dry_run_plan(&bad_sys, &usb_disk, None, None).is_err());
+
+    // Reject Disk 0 / system disk
+    let sys_disk = make_disk(0, "NVMe", 512, true, true, vec![]);
+    assert!(build_dry_run_plan(&opts, &sys_disk, None, None).is_err());
+}
+
+#[test]
+fn test_select_bcdboot_candidates_prefers_target_first() {
+    let tmp_root = std::env::temp_dir().join(format!("wintousb_bcd_cand_{}", std::process::id()));
+    let target_win = tmp_root.join("target_win");
+    let host_win = tmp_root.join("host_win");
+    fs::create_dir_all(target_win.join("System32")).unwrap();
+    fs::create_dir_all(host_win.join("System32")).unwrap();
+
+    let target_exe = target_win.join("System32").join("bcdboot.exe");
+    let host_exe = host_win.join("System32").join("bcdboot.exe");
+    fs::write(&host_exe, b"host").unwrap();
+
+    // When target bcdboot.exe does not exist, host comes alone
+    let only_host = resolve_bcdboot_candidates_from_dirs(&target_win, &host_win);
+    assert_eq!(only_host, vec![host_exe.to_string_lossy().to_string()]);
+
+    // When target bcdboot.exe exists, target is strictly preferred before host
+    fs::write(&target_exe, b"target").unwrap();
+    let both = resolve_bcdboot_candidates_from_dirs(&target_win, &host_win);
+    assert_eq!(
+        both,
+        vec![
+            target_exe.to_string_lossy().to_string(),
+            host_exe.to_string_lossy().to_string()
+        ]
+    );
+
+    // Same directory deduplicates cleanly
+    let dedup = resolve_bcdboot_candidates_from_dirs(&host_win, &host_win);
+    assert_eq!(dedup.len(), 1);
+
+    // Live helper always returns at least one host candidate
+    let live_cands = select_bcdboot_candidates('Z');
+    assert!(!live_cands.is_empty());
+
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[test]
+fn test_verify_bcd_enum_retargeted() {
+    let ok_en = "\
+identifier              {default}
+device                  partition=Y:
+path                    \\WINDOWS\\system32\\winload.efi
+osdevice                partition=Y:
+";
+    assert!(verify_bcd_enum_retargeted(ok_en, 'Y', 'C'));
+
+    let ok_vhdx = "\
+identifier              {default}
+device                  vhd=[W:]\\WinToGo.vhdx
+osdevice                vhd=[W:]\\WinToGo.vhdx
+";
+    assert!(verify_bcd_enum_retargeted(ok_vhdx, 'X', 'C'));
+
+    let bad_half = "\
+identifier              {default}
+device                  partition=Y:
+osdevice                partition=C:
+";
+    assert!(!verify_bcd_enum_retargeted(bad_half, 'Y', 'C'));
+
+    let bad_host = "\
+identifier              {default}
+device                  partition=C:
+osdevice                partition=C:
+";
+    assert!(!verify_bcd_enum_retargeted(bad_host, 'Y', 'C'));
 }
