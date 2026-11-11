@@ -1,0 +1,28 @@
+[package]
+name = "wintousb"
+version = "1.0.0"
+edition = "2021"
+authors = ["GlitchWorlds"]
+description = "Native Rust Windows To Go Creator, Live OS Hot-Cloner & Bootable USB Suite"
+license = "MIT"
+
+[[bin]]
+name = "WinToUSB"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.30.0", default-features = false, features = ["default_fonts", "glow"] }
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
